@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Boss 直聘辅助投递",
+  "description": "基于用户配置在 Boss 直聘网页中辅助筛选岗位、发送沟通内容并记录结果。",
+  "version": "0.1.0",
+  "action": {
+    "default_popup": "index.html",
+    "default_title": "Boss 辅助投递"
+  },
+  "permissions": ["activeTab", "storage", "scripting", "tabs"],
+  "host_permissions": ["https://www.zhipin.com/*", "https://*.zhipin.com/*"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.zhipin.com/*", "https://*.zhipin.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
