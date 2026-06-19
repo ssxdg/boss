@@ -1,5 +1,8 @@
 import { makeDebugInfo } from './shared/diagnostics';
+import { buildBackgroundJobSearchUrl, shouldAllowChatPageSend, shouldRedirectWaitingChatToSearch } from './shared/backgroundNavigation';
 import { getRandomDelaySec, isDailyLimitReached, todayKey } from './shared/domain';
+import { getExcludedJobKeys } from './shared/jobIdentity';
+import { getNextRunAt } from './shared/scheduler';
 import {
   appendLog,
   clearLogs,
@@ -9,10 +12,15 @@ import {
   saveConfig,
   saveRuntimeState,
 } from './shared/storage';
-import type { ApplyLog, CommandMessage, ContentResult, RuntimeState } from './shared/types';
+import type { ApplyLog, CommandMessage, ContentResult, JobInfo, RuntimeState } from './shared/types';
 
 const FAILURE_THRESHOLD = 3;
+const MAX_RUN_STEPS = 8;
+const SEARCH_NAVIGATION_TIMEOUT_MS = 15000;
+const CONTENT_RETRY_DELAY_MS = 2500;
+const NEXT_RUN_ALARM_NAME = 'boss-auto-apply-next-run';
 let consecutiveFailures = 0;
+let nextRunTimeoutId: ReturnType<typeof setTimeout> | undefined;
 
 chrome.runtime.onInstalled.addListener(async () => {
   const config = await getConfig();
@@ -25,6 +33,14 @@ chrome.runtime.onMessage.addListener((message: CommandMessage, _sender, sendResp
   return true;
 });
 
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== NEXT_RUN_ALARM_NAME) {
+    return;
+  }
+
+  void runIfEnabled();
+});
+
 async function handleMessage(message: CommandMessage) {
   if (message.type === 'GET_STATE') {
     return { config: await getConfig(), logs: await getLogs(), state: await getRuntimeState() };
@@ -32,7 +48,8 @@ async function handleMessage(message: CommandMessage) {
 
   if (message.type === 'CLEAR_LOGS') {
     await clearLogs();
-    await setState({ status: 'idle', todayAppliedCount: 0, lastReason: '日志已清空' });
+    await clearNextRunAlarm();
+    await setState({ status: 'idle', todayAppliedCount: 0, lastReason: '日志已清空', nextRunAt: undefined });
     return { ok: true };
   }
 
@@ -42,16 +59,25 @@ async function handleMessage(message: CommandMessage) {
   }
 
   if (message.type === 'START_AUTO_APPLY' || message.type === 'RUN_ON_ACTIVE_TAB') {
-    return runOnActiveTab();
+    return runOnActiveTab(message.type === 'START_AUTO_APPLY' ? message.config : undefined);
   }
 
   return { ok: false, reason: '未知命令' };
 }
 
-async function runOnActiveTab() {
-  const config = await getConfig();
+async function runOnActiveTab(configOverride?: Awaited<ReturnType<typeof getConfig>>) {
+  await clearNextRunAlarm();
+
+  const storedConfig = await getConfig();
+  const config = configOverride ? { ...storedConfig, ...configOverride } : storedConfig;
+  const previousState = await getRuntimeState();
+  if (configOverride) {
+    await saveConfig(config);
+  }
+
   const logs = await getLogs();
   const todayAppliedCount = countToday(logs);
+  const excludedJobKeys = getExcludedJobKeys(logs);
 
   if (isDailyLimitReached(todayAppliedCount, config.dailyLimit)) {
     await pause('已达到今日投递上限');
@@ -63,14 +89,69 @@ async function runOnActiveTab() {
     await pause('当前页面不是 Boss 直聘目标页面');
     return { ok: false, reason: '当前页面不是 Boss 直聘目标页面' };
   }
+  const tabId = tab.id;
+  let activeTabUrl: string | undefined = tab.url;
+  let hasLeftInitialWaitingChat = !shouldRedirectWaitingChatToSearch(previousState.status, activeTabUrl ?? '');
 
   await saveConfig({ ...config, enabled: true });
-  await setState({ status: 'running', todayAppliedCount });
+  await setState({ status: 'running', todayAppliedCount, nextRunAt: undefined, debugInfo: undefined });
 
   try {
-    const result = await sendContentRunMessage(tab.id, tab.url, config, todayAppliedCount);
-    await handleContentResult(result);
-    return { ok: result.ok, result };
+    if (shouldRedirectWaitingChatToSearch(previousState.status, activeTabUrl ?? '')) {
+      const searchUrl = buildBackgroundJobSearchUrl(config);
+      if (!searchUrl) {
+        await pause('上一轮已完成投递，但未配置岗位关键词，无法返回岗位列表查找下一个岗位');
+        return { ok: false, reason: '上一轮已完成投递，但未配置岗位关键词，无法返回岗位列表查找下一个岗位' };
+      }
+
+      await setState({
+        status: 'running',
+        todayAppliedCount,
+        lastReason: '上一轮已完成投递，正在返回岗位列表查找下一个岗位',
+      });
+      await chrome.tabs.update(tabId, { url: searchUrl });
+      await waitForTabComplete(tabId, SEARCH_NAVIGATION_TIMEOUT_MS);
+      activeTabUrl = (await chrome.tabs.get(tabId)).url;
+      hasLeftInitialWaitingChat = true;
+    }
+
+    let lastWaitReason = '';
+    for (let step = 0; step < MAX_RUN_STEPS; step += 1) {
+      const allowChatPageSend = shouldAllowChatPageSend(previousState.status, hasLeftInitialWaitingChat);
+      const result = await sendContentRunMessage(tabId, activeTabUrl, config, todayAppliedCount, excludedJobKeys, allowChatPageSend);
+      if (result.ok && result.status === 'searched') {
+        lastWaitReason = result.reason ?? '已打开岗位搜索页，继续筛选岗位';
+        await setState({
+          status: 'running',
+          todayAppliedCount,
+          lastReason: lastWaitReason,
+        });
+        await chrome.tabs.update(tabId, { url: result.searchUrl });
+        await waitForTabComplete(tabId, SEARCH_NAVIGATION_TIMEOUT_MS);
+        activeTabUrl = (await chrome.tabs.get(tabId)).url;
+        hasLeftInitialWaitingChat = true;
+        continue;
+      }
+
+      if (result.ok && result.status === 'loading') {
+        lastWaitReason = result.reason ?? '页面仍在加载，稍后重试';
+        await setState({
+          status: 'running',
+          todayAppliedCount,
+          lastReason: lastWaitReason,
+        });
+        await delay(CONTENT_RETRY_DELAY_MS);
+        activeTabUrl = (await chrome.tabs.get(tabId)).url;
+        continue;
+      }
+
+      await handleContentResult(result);
+      return { ok: result.ok, result };
+    }
+
+    const reason = `${lastWaitReason || 'Boss 页面加载超时'}，已超过最大等待次数；请确认 Boss 页面已加载完成后重试`;
+    await pause(reason);
+    return { ok: false, reason };
   } catch (error) {
     const debugInfo = makeDebugInfo({
       phase: 'send-message-after-injection',
@@ -94,12 +175,16 @@ async function sendContentRunMessage(
   tabUrl: string | undefined,
   config: Awaited<ReturnType<typeof getConfig>>,
   todayAppliedCount: number,
+  excludedJobKeys: string[],
+  allowChatPageSend: boolean,
 ): Promise<ContentResult> {
   try {
     return (await chrome.tabs.sendMessage(tabId, {
       type: 'CONTENT_RUN',
       config,
       todayAppliedCount,
+      excludedJobKeys,
+      allowChatPageSend,
     })) as ContentResult;
   } catch (firstError) {
     await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
@@ -108,6 +193,8 @@ async function sendContentRunMessage(
         type: 'CONTENT_RUN',
         config,
         todayAppliedCount,
+        excludedJobKeys,
+        allowChatPageSend,
       })) as ContentResult;
     } catch (secondError) {
       throw new Error(
@@ -126,9 +213,19 @@ async function sendContentRunMessage(
 }
 
 async function handleContentResult(result: ContentResult): Promise<void> {
+  if (result.ok && result.status === 'searched') {
+    await setState({ status: 'running', lastReason: result.reason ?? '已打开岗位搜索页' });
+    return;
+  }
+
+  if (result.ok && result.status === 'loading') {
+    await setState({ status: 'running', lastReason: result.reason ?? '职位列表仍在加载' });
+    return;
+  }
+
   if (!result.ok) {
     consecutiveFailures += 1;
-    await appendLog(makePausedLog(result.reason, result.status));
+    await appendLog(makeResultLog(result.reason, result.status, result.job));
     if (consecutiveFailures >= FAILURE_THRESHOLD) {
       await pause('连续失败次数达到阈值');
       return;
@@ -136,6 +233,7 @@ async function handleContentResult(result: ContentResult): Promise<void> {
     await setState({
       status: result.status === 'paused' ? 'waiting_for_user' : 'error',
       lastReason: result.reason,
+      nextRunAt: undefined,
       debugInfo: result.debugInfo,
     });
     return;
@@ -159,13 +257,75 @@ async function handleContentResult(result: ContentResult): Promise<void> {
   }
 
   const delay = getRandomDelaySec(config.delayMinSec, config.delayMaxSec);
-  await setState({ status: 'paused', todayAppliedCount, lastReason: `等待 ${delay} 秒后可继续` });
+  await scheduleNextRun(delay, todayAppliedCount);
+}
+
+async function scheduleNextRun(delaySec: number, todayAppliedCount: number): Promise<void> {
+  const nextRunAt = getNextRunAt(Date.now(), delaySec);
+  chrome.alarms.create(NEXT_RUN_ALARM_NAME, { when: Date.parse(nextRunAt) });
+  nextRunTimeoutId = setTimeout(() => {
+    void runIfEnabled();
+  }, Math.max(0, delaySec) * 1000);
+  await setState({
+    status: 'waiting',
+    todayAppliedCount,
+    lastReason: `等待 ${delaySec} 秒后投递下一个`,
+    nextRunAt,
+    debugInfo: undefined,
+  });
+}
+
+async function runIfEnabled(): Promise<void> {
+  const config = await getConfig();
+  if (config.enabled) {
+    await runOnActiveTab();
+  }
+}
+
+function waitForTabComplete(tabId: number, timeoutMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false;
+
+    const finish = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      chrome.tabs.onUpdated.removeListener(listener);
+      clearTimeout(timer);
+      resolve();
+    };
+
+    const listener = (updatedTabId: number, changeInfo: { status?: string }) => {
+      if (updatedTabId === tabId && changeInfo.status === 'complete') {
+        finish();
+      }
+    };
+
+    const timer = setTimeout(finish, timeoutMs);
+    chrome.tabs.onUpdated.addListener(listener);
+  });
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 async function pause(reason: string, debugInfo?: RuntimeState['debugInfo']): Promise<void> {
+  await clearNextRunAlarm();
   const config = await getConfig();
   await saveConfig({ ...config, enabled: false });
-  await setState({ status: 'paused', todayAppliedCount: countToday(await getLogs()), lastReason: reason, debugInfo });
+  await setState({ status: 'paused', todayAppliedCount: countToday(await getLogs()), lastReason: reason, nextRunAt: undefined, debugInfo });
+}
+
+async function clearNextRunAlarm(): Promise<void> {
+  if (nextRunTimeoutId !== undefined) {
+    clearTimeout(nextRunTimeoutId);
+    nextRunTimeoutId = undefined;
+  }
+  await chrome.alarms.clear(NEXT_RUN_ALARM_NAME);
 }
 
 async function setState(partial: Partial<RuntimeState>): Promise<void> {
@@ -178,14 +338,14 @@ function countToday(logs: ApplyLog[]): number {
   return logs.filter((log) => log.status === 'applied' && log.createdAt.startsWith(key)).length;
 }
 
-function makePausedLog(reason: string, status: 'paused' | 'failed'): ApplyLog {
+function makeResultLog(reason: string, status: 'paused' | 'failed', job?: JobInfo): ApplyLog {
   return {
     id: crypto.randomUUID(),
-    jobTitle: '',
-    company: '',
-    city: '',
-    salary: '',
-    url: '',
+    jobTitle: job?.jobTitle ?? '',
+    company: job?.company ?? '',
+    city: job?.city ?? '',
+    salary: job?.salary ?? '',
+    url: job?.url ?? '',
     status,
     reason,
     createdAt: new Date().toISOString(),

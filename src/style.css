@@ -105,6 +105,10 @@ p {
   border-left-color: #16803c;
 }
 
+.status-waiting {
+  border-left-color: #0e7490;
+}
+
 .status-paused {
   border-left-color: #b7791f;
 }

@@ -26,9 +26,10 @@ export interface ApplyLog extends JobInfo {
 }
 
 export interface RuntimeState {
-  status: 'idle' | 'running' | 'paused' | 'waiting_for_user' | 'error';
+  status: 'idle' | 'running' | 'waiting' | 'paused' | 'waiting_for_user' | 'error';
   todayAppliedCount: number;
   lastReason?: string;
+  nextRunAt?: string;
   debugInfo?: DebugInfo;
   updatedAt: string;
 }
@@ -54,16 +55,24 @@ export interface MatchResult {
 }
 
 export type CommandMessage =
-  | { type: 'START_AUTO_APPLY' }
+  | { type: 'START_AUTO_APPLY'; config?: AutoApplyConfig }
   | { type: 'PAUSE_AUTO_APPLY'; reason?: string }
   | { type: 'GET_STATE' }
   | { type: 'CLEAR_LOGS' }
   | { type: 'RUN_ON_ACTIVE_TAB' };
 
 export type ContentMessage =
-  | { type: 'CONTENT_RUN'; config: AutoApplyConfig; todayAppliedCount: number }
+  | {
+      type: 'CONTENT_RUN';
+      config: AutoApplyConfig;
+      todayAppliedCount: number;
+      excludedJobKeys: string[];
+      allowChatPageSend: boolean;
+    }
   | { type: 'CONTENT_PAUSE'; reason: string };
 
 export type ContentResult =
   | { ok: true; job: JobInfo; status: 'applied' | 'skipped'; reason?: string; warnings?: string[]; debugInfo?: DebugInfo }
-  | { ok: false; status: 'paused' | 'failed'; reason: string; debugInfo?: DebugInfo };
+  | { ok: true; status: 'searched'; searchUrl: string; reason?: string; debugInfo?: DebugInfo }
+  | { ok: true; status: 'loading'; reason?: string; debugInfo?: DebugInfo }
+  | { ok: false; status: 'paused' | 'failed'; reason: string; job?: JobInfo; debugInfo?: DebugInfo };

@@ -5,6 +5,7 @@ import {
   isDailyLimitReached,
   isDelayInRange,
   jobMatchesConfig,
+  parseKeywords,
   parseSalaryRange,
   renderMessageTemplate,
   selectMessageTemplate,
@@ -59,6 +60,23 @@ describe('parseSalaryRange', () => {
 
   it('returns nulls for unknown salaries', () => {
     expect(parseSalaryRange('薪资面议')).toEqual({ min: null, max: null });
+  });
+});
+
+describe('parseKeywords', () => {
+  it('splits keywords by common Chinese and English separators', () => {
+    expect(parseKeywords('前端, React，Vue、Node.js  TypeScript\nJavaScript')).toEqual([
+      '前端',
+      'React',
+      'Vue',
+      'Node.js',
+      'TypeScript',
+      'JavaScript',
+    ]);
+  });
+
+  it('drops empty keyword fragments', () => {
+    expect(parseKeywords('  前端 ,, ， React  ')).toEqual(['前端', 'React']);
   });
 });
 

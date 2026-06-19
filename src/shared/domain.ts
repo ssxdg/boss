@@ -15,6 +15,13 @@ export const DEFAULT_CONFIG: AutoApplyConfig = {
   enabled: false,
 };
 
+export function parseKeywords(value: string): string[] {
+  return value
+    .split(/[\s,，、;；]+/)
+    .map((keyword) => keyword.trim())
+    .filter(Boolean);
+}
+
 export function parseSalaryRange(salary: string): { min: number | null; max: number | null } {
   const normalized = salary.replace(/\s/g, '').toUpperCase();
   const range = normalized.match(/(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)K/);
@@ -37,7 +44,7 @@ export function parseSalaryRange(salary: string): { min: number | null; max: num
 }
 
 export function jobMatchesConfig(job: JobInfo, config: AutoApplyConfig): MatchResult {
-  const keywords = config.keywords.map((keyword) => keyword.trim()).filter(Boolean);
+  const keywords = parseKeywords(config.keywords.join(' '));
   if (keywords.length > 0 && !keywords.some((keyword) => job.jobTitle.includes(keyword))) {
     return { matched: false, reason: '岗位关键词不匹配' };
   }

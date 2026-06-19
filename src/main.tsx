@@ -2,7 +2,9 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Download, Pause, Play, RefreshCcw, Save, Trash2, Upload } from 'lucide-react';
 import './style.css';
-import { DEFAULT_CONFIG } from './shared/domain';
+import { DEFAULT_CONFIG, parseKeywords } from './shared/domain';
+import { shouldReplaceConfigFromSnapshot } from './shared/popupState';
+import { getRemainingDelaySec } from './shared/scheduler';
 import type { ApplyLog, AutoApplyConfig, RuntimeState } from './shared/types';
 
 type Snapshot = {
@@ -22,12 +24,15 @@ function App() {
   const [logs, setLogs] = useState<ApplyLog[]>([]);
   const [state, setState] = useState<RuntimeState>(fallbackState);
   const [notice, setNotice] = useState('正在读取扩展状态...');
+  const [nowMs, setNowMs] = useState(Date.now());
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const hasUnsavedConfigRef = useRef(false);
 
   const statusLabel = useMemo(() => {
     const labels: Record<RuntimeState['status'], string> = {
       idle: '空闲',
       running: '运行中',
+      waiting: '等待下一次',
       paused: '已暂停',
       waiting_for_user: '等待人工处理',
       error: '页面异常',
@@ -35,14 +40,64 @@ function App() {
     return labels[state.status];
   }, [state.status]);
 
+  const statusReason = useMemo(() => {
+    const remainingDelaySec = getRemainingDelaySec(state.nextRunAt, nowMs);
+    if (state.status === 'waiting' && remainingDelaySec !== null) {
+      return remainingDelaySec > 0 ? `等待 ${remainingDelaySec} 秒后投递下一个` : '即将投递下一个';
+    }
+
+    return state.lastReason ?? notice;
+  }, [notice, nowMs, state.lastReason, state.nextRunAt, state.status]);
+
   useEffect(() => {
-    void refresh();
+    const timer = window.setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+
+    return () => {
+      window.clearInterval(timer);
+    };
   }, []);
 
-  async function refresh() {
+  useEffect(() => {
+    void refresh({ forceConfig: true });
+    const timer = window.setInterval(() => {
+      void refresh();
+    }, 2000);
+
+    const listener = (changes: Record<string, chrome.storage.StorageChange>, areaName: string) => {
+      if (areaName === 'local' && (changes.runtimeState || changes.applyLogs)) {
+        void refresh();
+      }
+      if (areaName === 'local' && changes.autoApplyConfig) {
+        void refresh({ forceConfig: false });
+      }
+    };
+
+    if (typeof chrome !== 'undefined' && chrome.storage?.onChanged) {
+      chrome.storage.onChanged.addListener(listener);
+    }
+
+    return () => {
+      window.clearInterval(timer);
+      if (typeof chrome !== 'undefined' && chrome.storage?.onChanged) {
+        chrome.storage.onChanged.removeListener(listener);
+      }
+    };
+  }, []);
+
+  async function refresh(options: { forceConfig?: boolean } = {}) {
     const snapshot = await sendMessage<Snapshot>({ type: 'GET_STATE' });
     if (snapshot) {
-      setConfig(snapshot.config);
+      if (
+        shouldReplaceConfigFromSnapshot({
+          hasUnsavedChanges: hasUnsavedConfigRef.current,
+          force: options.forceConfig,
+        })
+      ) {
+        setConfig(snapshot.config);
+        hasUnsavedConfigRef.current = false;
+      }
       setLogs(snapshot.logs);
       setState(snapshot.state);
       setNotice(snapshot.state.lastReason ?? '状态已更新');
@@ -54,13 +109,15 @@ function App() {
   async function saveConfig(nextConfig = config) {
     await chrome.storage.local.set({ autoApplyConfig: nextConfig });
     setConfig(nextConfig);
+    hasUnsavedConfigRef.current = false;
     setNotice('配置已保存');
   }
 
   async function start() {
-    await saveConfig({ ...config, enabled: true });
-    await sendMessage({ type: 'START_AUTO_APPLY' });
-    await refresh();
+    const nextConfig = { ...config, keywords: parseKeywords(config.keywords.join(' ')), enabled: true };
+    await saveConfig(nextConfig);
+    await sendMessage({ type: 'START_AUTO_APPLY', config: nextConfig });
+    await refresh({ forceConfig: true });
   }
 
   async function pause() {
@@ -74,6 +131,7 @@ function App() {
   }
 
   function update<K extends keyof AutoApplyConfig>(key: K, value: AutoApplyConfig[K]) {
+    hasUnsavedConfigRef.current = true;
     setConfig((previous) => ({ ...previous, [key]: value }));
   }
 
@@ -102,7 +160,7 @@ function App() {
           <h1>Boss 辅助投递</h1>
           <p>只在已登录 Boss 直聘页面内运行，遇到验证或异常会暂停。</p>
         </div>
-        <button className="icon-button" onClick={refresh} title="刷新状态" type="button">
+        <button className="icon-button" onClick={() => void refresh()} title="刷新状态" type="button">
           <RefreshCcw size={17} />
         </button>
       </header>
@@ -118,7 +176,7 @@ function App() {
             {state.todayAppliedCount}/{config.dailyLimit}
           </strong>
         </div>
-        <p>{state.lastReason ?? notice}</p>
+        <p>{statusReason}</p>
       </section>
 
       {state.debugInfo ? (
@@ -172,10 +230,7 @@ function App() {
             onChange={(event) =>
               update(
                 'keywords',
-                event.target.value
-                  .split(',')
-                  .map((item) => item.trim())
-                  .filter(Boolean),
+                parseKeywords(event.target.value),
               )
             }
             placeholder="前端, React"

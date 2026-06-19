@@ -7,6 +7,20 @@ import type {
   MatchResult,
   TemplateRenderResult,
 } from './shared/types';
+import {
+  clickElementSafely,
+  describeElement,
+  findChatMessageInput,
+  findChatSendButton,
+  findContactButton,
+  findJobCardContainer,
+  hasUploadAttachmentDialog,
+  isDisabledAction,
+} from './shared/domActions';
+import { decideChatPageAction } from './shared/chatFlow';
+import { parseChatHeaderJob } from './shared/chatJobParser';
+import { waitForInputText } from './shared/inputSync';
+import { buildBossJobSearchUrl, hasBossSalaryFilter, isBossChatPage, isBossJobSearchPage, shouldStartJobSearch } from './shared/jobSearch';
 
 chrome.runtime.onMessage.addListener((message: ContentMessage, _sender, sendResponse) => {
   if (message.type === 'CONTENT_RUN') {
@@ -37,29 +51,109 @@ async function runOnce(message: Extract<ContentMessage, { type: 'CONTENT_RUN' }>
     return { ok: false, status: 'paused', reason: '已达到今日投递上限' };
   }
 
-  const jobSelection = readBestJob(message.config);
-  if (!jobSelection) {
-    const chatInput = await waitForElement(findMessageInput, 8000);
-    if (chatInput) {
-      const fallbackJob = makeFallbackChatJob();
-      const template = selectMessageTemplate(message.config.messageTemplates, message.todayAppliedCount);
-      const rendered = renderMessageTemplate(template, fallbackJob);
-      const action = await fillAndSendMessage(rendered.message);
-      if (!action.ok) {
+  const listJobs = readJobList();
+
+  if (isBossChatPage(location.href)) {
+    const currentJob = await waitUntil(() => readCurrentJob(), 8000);
+    const action = decideChatPageAction({
+      allowChatPageSend: message.allowChatPageSend,
+      hasCurrentJob: Boolean(currentJob),
+      isCurrentJobExcluded: currentJob ? isExcludedJob(currentJob, message.excludedJobKeys) : false,
+    });
+
+    if (action === 'wait_for_current_job') {
+      return {
+        ok: true,
+        status: 'loading',
+        reason: 'Boss 聊天页岗位信息仍在加载，等待当前沟通对象渲染完成',
+        debugInfo: makeDebugInfo({
+          phase: 'wait-chat-current-job',
+          tabUrl: location.href,
+          details: collectPageDiagnostics(),
+        }),
+      };
+    }
+
+    if (action === 'return_to_search') {
+      const searchUrl = buildBossJobSearchUrl(message.config, location.origin);
+      if (!searchUrl) {
         return {
           ok: false,
-          status: action.status,
-          reason: action.reason,
+          status: 'paused',
+          reason: '当前聊天岗位已处理，但未配置岗位关键词，无法返回岗位搜索列表',
           debugInfo: makeDebugInfo({
-            phase: 'fill-chat-without-job-metadata',
+            phase: 'redirect-chat-to-search',
             tabUrl: location.href,
             details: collectPageDiagnostics(),
           }),
         };
       }
-      return { ok: true, job: fallbackJob, status: 'applied', warnings: rendered.warnings };
+
+      return {
+        ok: true,
+        status: 'searched',
+        searchUrl,
+        reason: '当前聊天岗位已处理，返回岗位列表查找下一个岗位',
+      };
     }
 
+    const template = selectMessageTemplate(message.config.messageTemplates, message.todayAppliedCount);
+    const rendered = renderMessageTemplate(template, currentJob!);
+    const sendAction = await fillAndSendMessage(rendered.message);
+    if (!sendAction.ok) {
+      return {
+        ok: false,
+        status: sendAction.status,
+        reason: sendAction.reason,
+        job: currentJob!,
+        debugInfo: makeDebugInfo({
+          phase: 'fill-chat-page',
+          tabUrl: location.href,
+          details: collectPageDiagnostics(),
+        }),
+      };
+    }
+    return { ok: true, job: currentJob!, status: 'applied', warnings: rendered.warnings };
+  }
+
+  if (isBossJobSearchPage(location.href) && listJobs.length === 0 && isSearchResultStillLoading()) {
+    return {
+      ok: true,
+      status: 'loading',
+      reason: 'Boss 职位列表仍在加载，等待页面渲染完成',
+      debugInfo: makeDebugInfo({
+        phase: 'wait-job-search-results',
+        tabUrl: location.href,
+        details: collectPageDiagnostics(),
+      }),
+    };
+  }
+
+  if (shouldStartJobSearch(location.href, listJobs.length > 0)) {
+    const searchUrl = buildBossJobSearchUrl(message.config, location.origin);
+    if (!searchUrl) {
+      return {
+        ok: false,
+        status: 'paused',
+        reason: '请先在插件中配置岗位关键词，再从 Boss 首页启动自动搜索',
+        debugInfo: makeDebugInfo({
+          phase: 'prepare-job-search',
+          tabUrl: location.href,
+          details: collectPageDiagnostics(),
+        }),
+      };
+    }
+
+    return {
+      ok: true,
+      status: 'searched',
+      searchUrl,
+      reason: `已打开岗位搜索：${message.config.keywords.join(' ')}`,
+    };
+  }
+
+  const jobSelection = readBestJob(message.config, listJobs, message.excludedJobKeys);
+  if (!jobSelection) {
     return {
       ok: false,
       status: 'paused',
@@ -86,6 +180,7 @@ async function runOnce(message: Extract<ContentMessage, { type: 'CONTENT_RUN' }>
       ok: false,
       status: action.status,
       reason: action.reason,
+      job,
       debugInfo: makeDebugInfo({
         phase: 'fill-and-send-message',
         tabUrl: location.href,
@@ -114,29 +209,34 @@ function detectPageStatus(): { ok: true } | { ok: false; reason: string; details
   return { ok: true };
 }
 
-function readBestJob(config: AutoApplyConfig): { job: JobInfo; sourceElement?: HTMLElement } | null {
-  const listJobs = readJobList();
-  const matched = listJobs.find(({ job }) => jobMatchesConfig(job, config).matched);
+function readBestJob(
+  config: AutoApplyConfig,
+  listJobs = readJobList(),
+  excludedJobKeys: readonly string[] = [],
+): { job: JobInfo; sourceElement?: HTMLElement } | null {
+  const availableJobs = listJobs.filter(({ job }) => !isExcludedJob(job, excludedJobKeys));
+  const matched = availableJobs.find(({ job }) => jobMatchesConfig(job, config).matched);
   if (matched) {
     return matched;
   }
 
+  if (availableJobs.length > 0) {
+    return availableJobs[0];
+  }
+
   if (listJobs.length > 0) {
-    return listJobs[0];
+    return null;
   }
 
   const currentJob = readCurrentJob();
-  return currentJob ? { job: currentJob } : null;
+  return currentJob && !isExcludedJob(currentJob, excludedJobKeys) ? { job: currentJob } : null;
 }
 
 function readJobList(): Array<{ job: JobInfo; sourceElement: HTMLElement }> {
   const titleElements = Array.from(document.querySelectorAll<HTMLElement>('.job-title, [class*="job-title"]'));
   return titleElements
     .map((titleElement) => {
-      const card =
-        closestJobCard(titleElement) ??
-        titleElement.closest<HTMLElement>('li, [class*="job"], [class*="card"], [class*="item"]') ??
-        titleElement;
+      const card = findJobCardContainer(titleElement);
       const jobTitle = titleElement.textContent?.trim() ?? '';
       const company =
         textFromWithin(card, '.company-name') ||
@@ -145,8 +245,8 @@ function readJobList(): Array<{ job: JobInfo; sourceElement: HTMLElement }> {
         textFrom('[class*="company"]') ||
         '';
       const city =
-        textFromWithin(card, '[class*="city"]') ||
         inferFromElementText(card, /(北京|上海|广州|深圳|杭州|成都|武汉|南京|苏州|西安|重庆|天津)/) ||
+        textFromWithin(card, '[class*="city"]') ||
         '';
       const salary =
         textFromWithin(card, '.salary') ||
@@ -173,6 +273,13 @@ function readJobList(): Array<{ job: JobInfo; sourceElement: HTMLElement }> {
 }
 
 function readCurrentJob(): JobInfo | null {
+  if (isBossChatPage(location.href)) {
+    const chatJob = parseChatHeaderJob(readChatPageText(), location.href);
+    if (chatJob) {
+      return chatJob;
+    }
+  }
+
   const title =
     textFrom('.job-title') ||
     textFrom('.name') ||
@@ -208,51 +315,153 @@ async function fillAndSendMessage(
   message: string,
   sourceElement?: HTMLElement,
 ): Promise<{ ok: true } | { ok: false; status: 'paused' | 'failed'; reason: string }> {
-  if (!findMessageInput() && sourceElement) {
+  if (hasUploadAttachmentDialog()) {
+    return makeUploadAttachmentPausedResult('before-action');
+  }
+
+  let input = findMessageInput();
+
+  if (!input && sourceElement) {
     sourceElement.scrollIntoView({ block: 'center', inline: 'nearest' });
-    sourceElement.click();
-    await waitForPageHydration();
+    clickElementSafely(sourceElement);
+    await waitUntil(() => findMessageInput() || findContactButton() || (hasUploadAttachmentDialog() ? document.body : null), 5000);
+    if (hasUploadAttachmentDialog()) {
+      return makeUploadAttachmentPausedResult(`after-source-click ${describeElement(sourceElement)}`);
+    }
+    input = findMessageInput();
   }
 
-  const contactButton = findButton(['立即沟通', '继续沟通', '沟通']);
-  if (contactButton) {
-    contactButton.click();
-    await waitForElement(findMessageInput, 10000);
-  }
-
-  const input = await waitForElement(findMessageInput, 10000);
   if (!input) {
-    return { ok: false, status: 'failed', reason: '未找到沟通输入框或投递入口' };
+    const contactButton = await waitForElement(findContactButton, 8000);
+    if (!contactButton) {
+      return { ok: false, status: 'failed', reason: '未找到立即沟通按钮或聊天输入框' };
+    }
+
+    clickElementSafely(contactButton);
+    await waitUntil(() => findMessageInput() || (hasUploadAttachmentDialog() ? document.body : null), 10000);
+    if (hasUploadAttachmentDialog()) {
+      return makeUploadAttachmentPausedResult(`after-contact-click ${describeElement(contactButton)}`);
+    }
+    input = findMessageInput();
   }
 
-  input.focus();
-  if (input instanceof HTMLTextAreaElement || input instanceof HTMLInputElement) {
-    input.value = message;
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-  } else {
-    input.textContent = message;
-    input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: message }));
+  input = input ?? await waitForElement(findMessageInput, 10000);
+  if (!input) {
+    return { ok: false, status: 'failed', reason: '已点击立即沟通，但未进入聊天输入框' };
   }
 
-  const sendButton = findButton(['发送', '投递', '立即发送']);
-  if (!sendButton || sendButton.hasAttribute('disabled')) {
-    return { ok: false, status: 'failed', reason: '发送按钮不可用' };
+  writeMessageToInput(input, message);
+  if (!(await waitForInputText(input, message))) {
+    return { ok: false, status: 'failed', reason: '已定位聊天输入区，但消息内容写入失败' };
+  }
+
+  const sendButtonCandidate = findChatSendButton(input, document, { allowDisabled: true });
+  if (!sendButtonCandidate) {
+    return { ok: false, status: 'failed', reason: '未找到聊天输入框附近可用的发送按钮' };
+  }
+
+  const sendButton = await waitForElement(() => {
+    const button = findChatSendButton(input, document, { allowDisabled: true });
+    return button && !isDisabledAction(button) ? button : null;
+  }, 3000);
+  if (!sendButton) {
+    return { ok: false, status: 'failed', reason: '已填写沟通内容，但发送按钮仍未变为可用' };
   }
 
   sendButton.click();
+  await waitUntil(() => (hasUploadAttachmentDialog() ? document.body : null), 800);
+  if (hasUploadAttachmentDialog()) {
+    return makeUploadAttachmentPausedResult(`after-send-click ${describeElement(sendButton)}`);
+  }
+
   return { ok: true };
 }
 
-function closestJobCard(element: HTMLElement): HTMLElement | null {
-  let current: HTMLElement | null = element;
-  for (let depth = 0; current && depth < 6; depth += 1) {
-    const text = current.innerText;
-    if (/\d+(?:\.\d+)?-\d+(?:\.\d+)?K/.test(text) && /公司|经验|学历|本科|大专|年/.test(text)) {
-      return current;
+function readChatPageText(): string {
+  const input = findMessageInput();
+  let current = input?.parentElement ?? null;
+
+  for (let depth = 0; current && depth < 8; depth += 1) {
+    const text = current.innerText || current.textContent || '';
+    if (/\d+(?:\.\d+)?-\d+(?:\.\d+)?K/.test(text)) {
+      return text;
     }
     current = current.parentElement;
   }
-  return null;
+
+  return document.body.innerText;
+}
+
+function writeMessageToInput(input: HTMLElement, message: string): void {
+  input.click();
+  input.focus();
+
+  if (input instanceof HTMLTextAreaElement || input instanceof HTMLInputElement) {
+    setNativeValue(input, message);
+  } else {
+    input.textContent = '';
+    selectEditableContents(input);
+    const inserted = tryInsertText(message);
+    if (!inserted) {
+      dispatchPasteText(input, message);
+    }
+    if (!inserted || !(input.textContent || '').includes(message)) {
+      input.textContent = message;
+    }
+  }
+
+  input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: message }));
+  input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: message }));
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+  input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: ' ' }));
+}
+
+function setNativeValue(input: HTMLTextAreaElement | HTMLInputElement, value: string): void {
+  const prototype = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  const descriptor = Object.getOwnPropertyDescriptor(prototype, 'value');
+  descriptor?.set?.call(input, value);
+  if (input.value !== value) {
+    input.value = value;
+  }
+}
+
+function tryInsertText(message: string): boolean {
+  try {
+    return Boolean(document.execCommand?.('insertText', false, message));
+  } catch {
+    return false;
+  }
+}
+
+function selectEditableContents(element: HTMLElement): void {
+  const selection = window.getSelection();
+  if (!selection) {
+    return;
+  }
+
+  const range = document.createRange();
+  range.selectNodeContents(element);
+  range.collapse(false);
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
+function dispatchPasteText(element: HTMLElement, message: string): void {
+  try {
+    const clipboardData = new DataTransfer();
+    clipboardData.setData('text/plain', message);
+    element.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData }));
+  } catch {
+    element.dispatchEvent(new Event('paste', { bubbles: true, cancelable: true }));
+  }
+}
+
+function makeUploadAttachmentPausedResult(stage: string): { ok: false; status: 'paused'; reason: string } {
+  return {
+    ok: false,
+    status: 'paused',
+    reason: `检测到 Boss 上传附件弹窗，已暂停自动操作。触发位置：${stage}。请关闭弹窗后重新启动。`,
+  };
 }
 
 function textFromWithin(root: ParentNode, selector: string): string | null {
@@ -267,8 +476,8 @@ function inferFromElementText(element: HTMLElement, pattern: RegExp): string | n
 async function waitForPageHydration(timeoutMs = 12000): Promise<void> {
   await waitUntil(
     () =>
-      document.readyState === 'complete' ||
-      document.body.innerText.trim().length > 20 ||
+      (document.readyState === 'complete' && !isBossJobSearchPage(location.href)) ||
+      (!isBossJobSearchPage(location.href) && document.body.innerText.trim().length > 20) ||
       document.querySelectorAll('.job-title, [class*="job-title"], textarea, [contenteditable="true"]').length > 0,
     timeoutMs,
   );
@@ -302,31 +511,52 @@ function waitUntil<T>(predicate: () => T | null | false, timeoutMs: number): Pro
   });
 }
 
-function makeFallbackChatJob(): JobInfo {
-  return {
-    jobTitle: '',
-    company: '',
-    city: '',
-    salary: '',
-    url: location.href,
-  };
-}
-
 function jobMatchesConfig(job: JobInfo, config: AutoApplyConfig): MatchResult {
-  const keywords = config.keywords.map((keyword) => keyword.trim()).filter(Boolean);
+  const keywords = parseConfigKeywords(config.keywords);
   if (keywords.length > 0 && !keywords.some((keyword) => job.jobTitle.includes(keyword))) {
     return { matched: false, reason: '岗位关键词不匹配' };
   }
 
-  if (config.city.trim() && !job.city.includes(config.city.trim())) {
-    return { matched: false, reason: '城市不匹配' };
+  const configuredCity = config.city.trim();
+  if (configuredCity && !job.city.includes(configuredCity)) {
+    return {
+      matched: false,
+      reason: `城市不匹配：配置=${configuredCity}，岗位=${job.city || '未识别'}`,
+    };
   }
 
-  if (!salaryMatches(job.salary, config.salaryMin, config.salaryMax)) {
+  if (!hasBossSalaryFilter(location.href) && !salaryMatches(job.salary, config.salaryMin, config.salaryMax)) {
     return { matched: false, reason: '薪资范围不匹配' };
   }
 
   return { matched: true };
+}
+
+function parseConfigKeywords(keywords: string[]): string[] {
+  return keywords
+    .join(' ')
+    .split(/[\s,，、;；]+/)
+    .map((keyword) => keyword.trim())
+    .filter(Boolean);
+}
+
+function isExcludedJob(job: Pick<JobInfo, 'jobTitle' | 'company'>, excludedJobKeys: readonly string[]): boolean {
+  const key = getJobKey(job);
+  return Boolean(key && excludedJobKeys.includes(key));
+}
+
+function getJobKey(job: Pick<JobInfo, 'jobTitle' | 'company'>): string | null {
+  const title = normalizeJobField(job.jobTitle);
+  const company = normalizeJobField(job.company);
+  if (!title || !company) {
+    return null;
+  }
+
+  return `${title}\u0000${company}`;
+}
+
+function normalizeJobField(value: string): string {
+  return value.replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
 function salaryMatches(salary: string, min: number | null, max: number | null): boolean {
@@ -444,20 +674,23 @@ function inferFromText(pattern: RegExp): string | null {
   return document.body.innerText.match(pattern)?.[0] ?? null;
 }
 
-function findButton(labels: string[]): HTMLElement | null {
-  const candidates = Array.from(document.querySelectorAll<HTMLElement>('button, a, .btn, [role="button"]'));
-  return candidates.find((item) => labels.some((label) => item.innerText.includes(label))) ?? null;
-}
-
-function findMessageInput(): HTMLElement | null {
+function isSearchResultStillLoading(): boolean {
+  const bodyText = document.body.innerText.trim();
   return (
-    document.querySelector<HTMLElement>('textarea') ||
-    document.querySelector<HTMLElement>('input[type="text"]') ||
-    document.querySelector<HTMLElement>('[contenteditable="true"]')
+    bodyText.length === 0 ||
+    /加载中|请稍候|正在加载|loading/i.test(bodyText) ||
+    document.querySelectorAll('button, a, .btn, [role="button"]').length === 0
   );
 }
 
+function findMessageInput(): HTMLElement | null {
+  return findChatMessageInput();
+}
+
 function collectPageDiagnostics(): string[] {
+  const chatInput = findChatMessageInput();
+  const sendButton = chatInput ? findChatSendButton(chatInput, document, { allowDisabled: true }) : null;
+  const contactButton = findContactButton();
   return [
     `url=${location.href}`,
     `title=${document.title}`,
@@ -466,8 +699,14 @@ function collectPageDiagnostics(): string[] {
     `.name=${document.querySelectorAll('.name').length}`,
     `[class*="company"]=${document.querySelectorAll('[class*="company"]').length}`,
     `textarea=${document.querySelectorAll('textarea').length}`,
+    `input[type="text"]=${document.querySelectorAll('input[type="text"]').length}`,
+    `input[type="search"]=${document.querySelectorAll('input[type="search"]').length}`,
     `[contenteditable="true"]=${document.querySelectorAll('[contenteditable="true"]').length}`,
+    `[role="textbox"]=${document.querySelectorAll('[role="textbox"]').length}`,
     `button=${document.querySelectorAll('button, a, .btn, [role="button"]').length}`,
+    `contactButton=${describeElement(contactButton)}`,
+    `chatInput=${describeElement(chatInput)}`,
+    `chatSendButton=${describeElement(sendButton)} disabled=${sendButton ? isDisabledAction(sendButton) : 'n/a'}`,
     `bodyTextPrefix=${document.body.innerText.slice(0, 160).replace(/\s+/g, ' ')}`,
   ];
 }
