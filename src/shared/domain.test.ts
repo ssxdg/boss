@@ -47,6 +47,16 @@ describe('jobMatchesConfig', () => {
     const result = jobMatchesConfig({ ...baseJob, salary: '35-45K' }, baseConfig);
     expect(result).toEqual({ matched: false, reason: '薪资范围不匹配' });
   });
+
+  it('keeps jobs whose salary range is visually obfuscated by the page font', () => {
+    const result = jobMatchesConfig({ ...baseJob, salary: '□□-□□K' }, baseConfig);
+    expect(result).toEqual({ matched: true });
+  });
+
+  it('still skips undisclosed salaries when a salary range is configured', () => {
+    const result = jobMatchesConfig({ ...baseJob, salary: '薪资面议' }, baseConfig);
+    expect(result).toEqual({ matched: false, reason: '薪资范围不匹配' });
+  });
 });
 
 describe('parseSalaryRange', () => {

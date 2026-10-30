@@ -1,6 +1,21 @@
 /* @vitest-environment jsdom */
 import { describe, expect, it } from 'vitest';
-import { readInputText, waitForInputText } from './inputSync';
+import { readInputText, waitForInputClear, waitForInputText } from './inputSync';
+
+describe('waitForInputClear', () => {
+  it('waits for the sent draft to leave the chat input', async () => {
+    const input = document.createElement('textarea');
+    input.value = '您好，想了解岗位';
+    setTimeout(() => { input.value = ''; }, 30);
+    await expect(waitForInputClear(input, '您好，想了解岗位', 200, 10)).resolves.toBe(true);
+  });
+
+  it('does not report a send while the draft remains in the chat input', async () => {
+    const input = document.createElement('textarea');
+    input.value = '您好，想了解岗位';
+    await expect(waitForInputClear(input, '您好，想了解岗位', 30, 10)).resolves.toBe(false);
+  });
+});
 
 describe('waitForInputText', () => {
   it('waits for contenteditable text to settle after async page rendering', async () => {

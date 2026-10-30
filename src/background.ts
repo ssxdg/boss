@@ -1,5 +1,5 @@
 import { makeDebugInfo } from './shared/diagnostics';
-import { buildBackgroundJobSearchUrl, shouldAllowChatPageSend, shouldRedirectWaitingChatToSearch } from './shared/backgroundNavigation';
+import { buildBackgroundJobSearchUrl, isBossSecurityCheckPage, shouldAllowChatPageSend, shouldRedirectWaitingChatToSearch } from './shared/backgroundNavigation';
 import { getRandomDelaySec, isDailyLimitReached, todayKey } from './shared/domain';
 import { getExcludedJobKeys } from './shared/jobIdentity';
 import { getNextRunAt } from './shared/scheduler';
@@ -20,7 +20,7 @@ const SEARCH_NAVIGATION_TIMEOUT_MS = 15000;
 const CONTENT_RETRY_DELAY_MS = 2500;
 const NEXT_RUN_ALARM_NAME = 'boss-auto-apply-next-run';
 let consecutiveFailures = 0;
-let nextRunTimeoutId: ReturnType<typeof setTimeout> | undefined;
+let runInProgress = false;
 
 chrome.runtime.onInstalled.addListener(async () => {
   const config = await getConfig();
@@ -66,6 +66,19 @@ async function handleMessage(message: CommandMessage) {
 }
 
 async function runOnActiveTab(configOverride?: Awaited<ReturnType<typeof getConfig>>) {
+  if (runInProgress) {
+    return { ok: false, reason: '已有投递任务正在运行' };
+  }
+
+  runInProgress = true;
+  try {
+    return await executeRunOnActiveTab(configOverride);
+  } finally {
+    runInProgress = false;
+  }
+}
+
+async function executeRunOnActiveTab(configOverride?: Awaited<ReturnType<typeof getConfig>>) {
   await clearNextRunAlarm();
 
   const storedConfig = await getConfig();
@@ -110,13 +123,15 @@ async function runOnActiveTab(configOverride?: Awaited<ReturnType<typeof getConf
         lastReason: '上一轮已完成投递，正在返回岗位列表查找下一个岗位',
       });
       await chrome.tabs.update(tabId, { url: searchUrl });
-      await waitForTabComplete(tabId, SEARCH_NAVIGATION_TIMEOUT_MS);
+      await waitForUsableTab(tabId, SEARCH_NAVIGATION_TIMEOUT_MS);
       activeTabUrl = (await chrome.tabs.get(tabId)).url;
       hasLeftInitialWaitingChat = true;
     }
 
     let lastWaitReason = '';
     for (let step = 0; step < MAX_RUN_STEPS; step += 1) {
+      await waitForUsableTab(tabId, SEARCH_NAVIGATION_TIMEOUT_MS);
+      activeTabUrl = (await chrome.tabs.get(tabId)).url;
       const allowChatPageSend = shouldAllowChatPageSend(previousState.status, hasLeftInitialWaitingChat);
       const result = await sendContentRunMessage(tabId, activeTabUrl, config, todayAppliedCount, excludedJobKeys, allowChatPageSend);
       if (result.ok && result.status === 'searched') {
@@ -127,7 +142,7 @@ async function runOnActiveTab(configOverride?: Awaited<ReturnType<typeof getConf
           lastReason: lastWaitReason,
         });
         await chrome.tabs.update(tabId, { url: result.searchUrl });
-        await waitForTabComplete(tabId, SEARCH_NAVIGATION_TIMEOUT_MS);
+        await waitForUsableTab(tabId, SEARCH_NAVIGATION_TIMEOUT_MS);
         activeTabUrl = (await chrome.tabs.get(tabId)).url;
         hasLeftInitialWaitingChat = true;
         continue;
@@ -187,6 +202,22 @@ async function sendContentRunMessage(
       allowChatPageSend,
     })) as ContentResult;
   } catch (firstError) {
+    const currentTab = await chrome.tabs.get(tabId);
+    // 页面跳转时旧 content script 会被销毁，必须先等新页面稳定再重试通信。
+    if (currentTab.status === 'loading' || isBossSecurityCheckPage(currentTab.url ?? '')) {
+      await waitForUsableTab(tabId, SEARCH_NAVIGATION_TIMEOUT_MS);
+    }
+    const stableTab = await chrome.tabs.get(tabId);
+    if (stableTab.url !== tabUrl && stableTab.url?.includes('/web/geek/chat')) {
+      throw new Error('页面在发送过程中跳转到聊天页，无法确认消息是否已发送，请检查聊天记录后重试');
+    }
+    try {
+      return (await chrome.tabs.sendMessage(tabId, {
+        type: 'CONTENT_RUN', config, todayAppliedCount, excludedJobKeys, allowChatPageSend,
+      })) as ContentResult;
+    } catch {
+      // 已打开的旧页面可能没有自动注入脚本，此时再补注入。
+    }
     await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
     try {
       return (await chrome.tabs.sendMessage(tabId, {
@@ -263,9 +294,6 @@ async function handleContentResult(result: ContentResult): Promise<void> {
 async function scheduleNextRun(delaySec: number, todayAppliedCount: number): Promise<void> {
   const nextRunAt = getNextRunAt(Date.now(), delaySec);
   chrome.alarms.create(NEXT_RUN_ALARM_NAME, { when: Date.parse(nextRunAt) });
-  nextRunTimeoutId = setTimeout(() => {
-    void runIfEnabled();
-  }, Math.max(0, delaySec) * 1000);
   await setState({
     status: 'waiting',
     todayAppliedCount,
@@ -282,29 +310,19 @@ async function runIfEnabled(): Promise<void> {
   }
 }
 
-function waitForTabComplete(tabId: number, timeoutMs: number): Promise<void> {
-  return new Promise((resolve) => {
-    let settled = false;
-
-    const finish = () => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      chrome.tabs.onUpdated.removeListener(listener);
-      clearTimeout(timer);
-      resolve();
-    };
-
-    const listener = (updatedTabId: number, changeInfo: { status?: string }) => {
-      if (updatedTabId === tabId && changeInfo.status === 'complete') {
-        finish();
-      }
-    };
-
-    const timer = setTimeout(finish, timeoutMs);
-    chrome.tabs.onUpdated.addListener(listener);
-  });
+async function waitForUsableTab(tabId: number, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let tab = await chrome.tabs.get(tabId);
+  while ((tab.status !== 'complete' || isBossSecurityCheckPage(tab.url ?? '')) && Date.now() < deadline) {
+    await delay(250);
+    tab = await chrome.tabs.get(tabId);
+  }
+  if (isBossSecurityCheckPage(tab.url ?? '')) {
+    throw new Error('Boss 安全验证页面尚未结束，请在网页完成验证后重新启动插件');
+  }
+  if (tab.status !== 'complete') {
+    throw new Error('Boss 页面加载超时，请等待页面加载完成后重新启动插件');
+  }
 }
 
 function delay(ms: number): Promise<void> {
@@ -321,10 +339,6 @@ async function pause(reason: string, debugInfo?: RuntimeState['debugInfo']): Pro
 }
 
 async function clearNextRunAlarm(): Promise<void> {
-  if (nextRunTimeoutId !== undefined) {
-    clearTimeout(nextRunTimeoutId);
-    nextRunTimeoutId = undefined;
-  }
   await chrome.alarms.clear(NEXT_RUN_ALARM_NAME);
 }
 

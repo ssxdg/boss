@@ -19,7 +19,7 @@ import {
 } from './shared/domActions';
 import { decideChatPageAction } from './shared/chatFlow';
 import { parseChatHeaderJob } from './shared/chatJobParser';
-import { waitForInputText } from './shared/inputSync';
+import { waitForInputClear, waitForInputText } from './shared/inputSync';
 import { buildBossJobSearchUrl, hasBossSalaryFilter, isBossChatPage, isBossJobSearchPage, shouldStartJobSearch } from './shared/jobSearch';
 
 chrome.runtime.onMessage.addListener((message: ContentMessage, _sender, sendResponse) => {
@@ -174,6 +174,25 @@ async function runOnce(message: Extract<ContentMessage, { type: 'CONTENT_RUN' }>
 
   const template = selectMessageTemplate(message.config.messageTemplates, message.todayAppliedCount);
   const rendered = renderMessageTemplate(template, job);
+  if (!findMessageInput()) {
+    const selectedJobKey = `${job.jobTitle}\u0000${job.company}`;
+    if (sourceElement && sessionStorage.getItem('boss-auto-apply-selected-job') !== selectedJobKey) {
+      // 岗位卡片可能触发整页跳转，先回复后台，再由下一轮在稳定页面继续发送。
+      sourceElement.scrollIntoView({ block: 'center', inline: 'nearest' });
+      sessionStorage.setItem('boss-auto-apply-selected-job', selectedJobKey);
+      window.setTimeout(() => clickElementSafely(sourceElement), 0);
+      return { ok: true, status: 'loading', reason: '正在打开岗位详情，等待页面稳定后继续发送' };
+    }
+    const contactButton = findContactButton();
+    if (contactButton) {
+      // “立即沟通”也可能打开新页面，等待后台收到响应后再触发点击。
+      window.setTimeout(() => clickElementSafely(contactButton), 0);
+      return { ok: true, status: 'loading', reason: '正在打开聊天窗口，等待页面稳定后继续发送' };
+    }
+    if (sourceElement) {
+      return { ok: true, status: 'loading', reason: '正在等待岗位详情中的沟通入口' };
+    }
+  }
   const action = await fillAndSendMessage(rendered.message, sourceElement);
   if (!action.ok) {
     return {
@@ -374,6 +393,10 @@ async function fillAndSendMessage(
     return makeUploadAttachmentPausedResult(`after-send-click ${describeElement(sendButton)}`);
   }
 
+  if (!(await waitForInputClear(input, message))) {
+    return { ok: false, status: 'failed', reason: '已点击发送，但消息仍留在输入框中，无法确认发送成功' };
+  }
+
   return { ok: true };
 }
 
@@ -566,7 +589,8 @@ function salaryMatches(salary: string, min: number | null, max: number | null): 
 
   const parsed = parseSalaryRange(salary);
   if (parsed.min === null && parsed.max === null) {
-    return false;
+    const normalized = salary.replace(/\s/g, '').toUpperCase();
+    return /^[^\d]*[-~～—][^\d]*K$/.test(normalized);
   }
 
   const jobMin = parsed.min ?? parsed.max ?? 0;

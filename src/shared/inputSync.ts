@@ -33,6 +33,31 @@ export function waitForInputText(
   });
 }
 
+export function waitForInputClear(
+  input: HTMLElement,
+  sentText: string,
+  timeoutMs = 3000,
+  intervalMs = 100,
+): Promise<boolean> {
+  const expected = normalizeInputText(sentText);
+  const startedAt = Date.now();
+
+  return new Promise((resolve) => {
+    const tick = () => {
+      if (!normalizeInputText(readInputText(input)).includes(expected)) {
+        resolve(true);
+        return;
+      }
+      if (Date.now() - startedAt >= timeoutMs) {
+        resolve(false);
+        return;
+      }
+      setTimeout(tick, intervalMs);
+    };
+    tick();
+  });
+}
+
 function normalizeInputText(value: string): string {
   return value
     .replace(/\u00a0/g, ' ')

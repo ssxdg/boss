@@ -48,12 +48,17 @@ export function buildBackgroundJobSearchUrl(config: AutoApplyConfig, origin = 'h
   return url.toString();
 }
 
-export function shouldRedirectWaitingChatToSearch(status: string, urlLike: string): boolean {
-  return status === 'waiting' && isBossChatPage(urlLike);
+export function shouldRedirectWaitingChatToSearch(_status: string, urlLike: string): boolean {
+  return isBossChatPage(urlLike);
 }
 
 export function shouldAllowChatPageSend(status: string, hasLeftInitialWaitingChat: boolean): boolean {
   return status !== 'waiting' || hasLeftInitialWaitingChat;
+}
+
+export function isBossSecurityCheckPage(urlLike: string): boolean {
+  const url = parseUrl(urlLike);
+  return Boolean(url?.hostname.endsWith('zhipin.com') && url.searchParams.has('_security_check'));
 }
 
 function isBossChatPage(urlLike: string): boolean {

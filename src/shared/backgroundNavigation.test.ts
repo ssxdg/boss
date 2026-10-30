@@ -1,14 +1,19 @@
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_CONFIG } from './domain';
-import { buildBackgroundJobSearchUrl, shouldAllowChatPageSend, shouldRedirectWaitingChatToSearch } from './backgroundNavigation';
+import { buildBackgroundJobSearchUrl, isBossSecurityCheckPage, shouldAllowChatPageSend, shouldRedirectWaitingChatToSearch } from './backgroundNavigation';
 
 describe('background navigation', () => {
+  it('recognizes the Boss security redirect before injecting a content script', () => {
+    expect(isBossSecurityCheckPage('https://www.zhipin.com/web/geek/jobs?_security_check=1_123')).toBe(true);
+    expect(isBossSecurityCheckPage('https://www.zhipin.com/web/geek/jobs?query=React')).toBe(false);
+  });
   it('redirects the next scheduled run away from Boss chat before doing more work', () => {
     expect(shouldRedirectWaitingChatToSearch('waiting', 'https://www.zhipin.com/web/geek/chat')).toBe(true);
   });
 
-  it('does not redirect a manual running pass away from chat', () => {
-    expect(shouldRedirectWaitingChatToSearch('running', 'https://www.zhipin.com/web/geek/chat')).toBe(false);
+  it('starts a manual run from a job search instead of sending to the currently open chat', () => {
+    expect(shouldRedirectWaitingChatToSearch('running', 'https://www.zhipin.com/web/geek/chat')).toBe(true);
+    expect(shouldRedirectWaitingChatToSearch('idle', 'https://www.zhipin.com/web/geek/chat')).toBe(true);
   });
 
   it('blocks chat-page sending only until a scheduled run has left the old chat page', () => {

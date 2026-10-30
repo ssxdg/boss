@@ -67,7 +67,8 @@ export function salaryMatches(salary: string, min: number | null, max: number | 
 
   const parsed = parseSalaryRange(salary);
   if (parsed.min === null && parsed.max === null) {
-    return false;
+    const normalized = salary.replace(/\s/g, '').toUpperCase();
+    return /^[^\d]*[-~～—][^\d]*K$/.test(normalized);
   }
 
   const jobMin = parsed.min ?? parsed.max ?? 0;
