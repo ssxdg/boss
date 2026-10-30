@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Download, Pause, Play, RefreshCcw, Save, Trash2, Upload } from 'lucide-react';
+import { BriefcaseBusiness, Download, Pause, Play, RefreshCcw, Save, Trash2, Upload } from 'lucide-react';
 import './style.css';
 import { DEFAULT_CONFIG, parseKeywords } from './shared/domain';
 import { shouldReplaceConfigFromSnapshot } from './shared/popupState';
@@ -156,28 +156,35 @@ function App() {
   return (
     <main className="popup">
       <header className="topbar">
-        <div>
-          <h1>Boss 辅助投递</h1>
-          <p>只在已登录 Boss 直聘页面内运行，遇到验证或异常会暂停。</p>
+        <div className="brand">
+          <div className="brand-mark" aria-hidden="true"><BriefcaseBusiness size={21} strokeWidth={2.2} /></div>
+          <div>
+            <span className="eyebrow">求职效率工具</span>
+            <h1>Boss 辅助投递</h1>
+          </div>
         </div>
-        <button className="icon-button" onClick={() => void refresh()} title="刷新状态" type="button">
+        <button className="icon-button" onClick={() => void refresh()} title="刷新状态" aria-label="刷新状态" type="button">
           <RefreshCcw size={17} />
         </button>
       </header>
 
       <section className={`status status-${state.status}`}>
-        <div>
-          <span>当前状态</span>
-          <strong>{statusLabel}</strong>
+        <div className="status-main">
+          <span className="section-kicker">运行状态</span>
+          <strong><span className="status-dot" aria-hidden="true" />{statusLabel}</strong>
         </div>
-        <div>
-          <span>今日进度</span>
-          <strong>
-            {state.todayAppliedCount}/{config.dailyLimit}
-          </strong>
+        <div className="status-count">
+          <span>今日已投递</span>
+          <strong>{state.todayAppliedCount}<small> / {config.dailyLimit}</small></strong>
         </div>
-        <p>{statusReason}</p>
+        <div className="progress-track" role="progressbar" aria-label="今日投递进度" aria-valuenow={Math.min(Math.max(state.todayAppliedCount, 0), Math.max(config.dailyLimit, 1))} aria-valuemin={0} aria-valuemax={Math.max(config.dailyLimit, 1)}>
+          {/* 上限可能被配置为 0，进度宽度需要限制在有效百分比内。 */}
+          <span style={{ width: `${Math.min(100, Math.max(0, state.todayAppliedCount / Math.max(config.dailyLimit, 1) * 100))}%` }} />
+        </div>
+        <p className="status-reason">{statusReason}</p>
       </section>
+
+      <p className="safety-note">只在已登录的 Boss 直聘页面运行；遇到验证或异常时自动暂停。</p>
 
       {state.debugInfo ? (
         <section className="debug-panel">
@@ -211,7 +218,7 @@ function App() {
       ) : null}
 
       <section className="actions">
-        <button onClick={start} type="button">
+        <button className="primary-action" onClick={start} type="button">
           <Play size={16} />启动
         </button>
         <button onClick={pause} type="button">
@@ -222,69 +229,78 @@ function App() {
         </button>
       </section>
 
-      <section className="form-grid">
-        <label>
-          岗位关键词
-          <input
-            value={config.keywords.join(', ')}
+      <section className="settings-panel">
+        <div className="section-heading">
+          <div>
+            <span className="section-kicker">投递偏好</span>
+            <h2>筛选与节奏</h2>
+          </div>
+          <span className="section-hint">调整后点击保存</span>
+        </div>
+        <div className="form-grid">
+          <label>
+            岗位关键词
+            <input
+              value={config.keywords.join(', ')}
+              onChange={(event) =>
+                update(
+                  'keywords',
+                  parseKeywords(event.target.value),
+                )
+              }
+              placeholder="前端, React"
+            />
+          </label>
+          <label>
+            城市
+            <input value={config.city} onChange={(event) => update('city', event.target.value)} placeholder="上海" />
+          </label>
+          <label>
+            薪资下限 K
+            <input
+              type="number"
+              value={config.salaryMin ?? ''}
+              onChange={(event) => update('salaryMin', event.target.value ? Number(event.target.value) : null)}
+            />
+          </label>
+          <label>
+            薪资上限 K
+            <input
+              type="number"
+              value={config.salaryMax ?? ''}
+              onChange={(event) => update('salaryMax', event.target.value ? Number(event.target.value) : null)}
+            />
+          </label>
+          <label>
+            每日上限
+            <input type="number" value={config.dailyLimit} onChange={(event) => update('dailyLimit', Number(event.target.value))} />
+          </label>
+          <label>
+            最小间隔秒
+            <input type="number" value={config.delayMinSec} onChange={(event) => update('delayMinSec', Number(event.target.value))} />
+          </label>
+          <label>
+            最大间隔秒
+            <input type="number" value={config.delayMaxSec} onChange={(event) => update('delayMaxSec', Number(event.target.value))} />
+          </label>
+        </div>
+
+        <label className="templates">
+          沟通模板
+          <textarea
+            value={config.messageTemplates.join('\n')}
             onChange={(event) =>
               update(
-                'keywords',
-                parseKeywords(event.target.value),
+                'messageTemplates',
+                event.target.value
+                  .split('\n')
+                  .map((item) => item.trim())
+                  .filter(Boolean),
               )
             }
-            placeholder="前端, React"
           />
-        </label>
-        <label>
-          城市
-          <input value={config.city} onChange={(event) => update('city', event.target.value)} placeholder="上海" />
-        </label>
-        <label>
-          薪资下限 K
-          <input
-            type="number"
-            value={config.salaryMin ?? ''}
-            onChange={(event) => update('salaryMin', event.target.value ? Number(event.target.value) : null)}
-          />
-        </label>
-        <label>
-          薪资上限 K
-          <input
-            type="number"
-            value={config.salaryMax ?? ''}
-            onChange={(event) => update('salaryMax', event.target.value ? Number(event.target.value) : null)}
-          />
-        </label>
-        <label>
-          每日上限
-          <input type="number" value={config.dailyLimit} onChange={(event) => update('dailyLimit', Number(event.target.value))} />
-        </label>
-        <label>
-          最小间隔秒
-          <input type="number" value={config.delayMinSec} onChange={(event) => update('delayMinSec', Number(event.target.value))} />
-        </label>
-        <label>
-          最大间隔秒
-          <input type="number" value={config.delayMaxSec} onChange={(event) => update('delayMaxSec', Number(event.target.value))} />
         </label>
       </section>
-
-      <label className="templates">
-        沟通模板
-        <textarea
-          value={config.messageTemplates.join('\n')}
-          onChange={(event) =>
-            update(
-              'messageTemplates',
-              event.target.value
-                .split('\n')
-                .map((item) => item.trim())
-                .filter(Boolean),
-            )
-          }
-        />
-      </label>
 
       <section className="actions secondary">
         <input
@@ -306,7 +322,13 @@ function App() {
       </section>
 
       <section className="logs">
-        <h2>投递日志</h2>
+        <div className="section-heading">
+          <div>
+            <span className="section-kicker">最近动态</span>
+            <h2>投递日志</h2>
+          </div>
+          <span className="section-hint">最近 30 条</span>
+        </div>
         {logs.length === 0 ? (
           <p className="empty">暂无日志</p>
         ) : (
